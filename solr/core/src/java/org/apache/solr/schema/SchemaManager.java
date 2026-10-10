@@ -35,6 +35,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.apache.solr.client.api.model.AddCopyFieldOperation;
 import org.apache.solr.client.api.model.DeleteCopyFieldOperation;
@@ -57,6 +59,8 @@ import org.apache.solr.core.SolrResourceLoader;
 import org.apache.solr.handler.SolrConfigHandler;
 import org.apache.solr.request.SolrQueryRequest;
 import org.apache.solr.rest.BaseSolrResource;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.util.RefCounted;
 import org.apache.solr.util.TimeOut;
 import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
@@ -111,6 +115,7 @@ public class SchemaManager {
     String errorMsg = "Unable to persist managed schema. ";
     List<Map<String, Object>> errors = new ArrayList<>();
     int latestVersion = -1;
+    boolean appliedWithoutReload = false;
 
     synchronized (req.getSchema().getSchemaUpdateLock()) {
       while (!timeOut.hasTimedOut()) {
@@ -129,6 +134,21 @@ public class SchemaManager {
           }
         }
         if (!errors.isEmpty()) break;
+        if (isLiveSchemaChange(operations)) {
+          try {
+            managedIndexSchema.persistManagedSchema(false);
+            latestVersion = managedIndexSchema.getSchemaZkVersion();
+            core.setLatestSchema(managedIndexSchema);
+            appliedWithoutReload = true;
+          } catch (ManagedIndexSchema.SchemaChangedInZkException e) {
+            log.info("Schema was modified by another node. Retrying..");
+            continue;
+          } catch (SolrException e) {
+            log.warn(errorMsg, e);
+            errors = List.of(Map.of(CommandOperation.ERR_MSGS, errorMsg + e.getMessage()));
+          }
+          break;
+        }
         SolrResourceLoader loader = req.getCore().getResourceLoader();
         if (loader instanceof ZkSolrResourceLoader zkLoader) {
           StringWriter sw = new StringWriter();
@@ -184,12 +204,66 @@ public class SchemaManager {
       // replicas. This reduces the likelihood of a (time-limited) distributed deadlock during
       // concurrent schema updates.
       waitForOtherReplicasToUpdate(timeOut, latestVersion);
+    } else if (appliedWithoutReload) {
+      // Outside the schema update lock: autowarming can take a long time.
+      openSearcherWithLatestSchema(core, managedIndexSchema);
     }
     if (errors.isEmpty() && timeOut.hasTimedOut()) {
       log.warn("{} Timed out", errorMsg);
       errors = List.of(Map.of(CommandOperation.ERR_MSGS, errorMsg + "Timed out."));
     }
     return errors;
+  }
+
+  /**
+   * Schema additions that do not change existing fields, field types, or similarity, so they can be
+   * applied via {@link SolrCore#setLatestSchema}. A core reload would swap the IndexWriter and
+   * block indexing.
+   */
+  private static boolean isLiveSchemaChange(List<SchemaChange> operations) {
+    for (SchemaChange op : operations) {
+      OpType opType = OpType.get(op.operationType);
+      if (opType != OpType.ADD_FIELD
+          && opType != OpType.ADD_DYNAMIC_FIELD
+          && opType != OpType.ADD_COPY_FIELD) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Lets queries see the new schema without a commit in standalone mode (SOLR-13795). In SolrCloud,
+   * replicas pick it up on their next searcher reopen.
+   */
+  private static void openSearcherWithLatestSchema(SolrCore core, IndexSchema target)
+      throws InterruptedException {
+    String errorMsg = "Schema was persisted, but the searcher could not be reopened";
+    Future<?>[] waitSearcher = new Future<?>[1];
+    try {
+      core.getSearcher(true, false, waitSearcher);
+      if (waitSearcher[0] != null) {
+        waitSearcher[0].get();
+      }
+    } catch (ExecutionException e) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, errorMsg, e.getCause());
+    } catch (SolrException e) {
+      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, errorMsg, e);
+    }
+    // Registration failures are only logged, so check what actually got registered.
+    IndexSchema latest = core.getLatestSchema();
+    RefCounted<SolrIndexSearcher> searcher = core.getRegisteredSearcher();
+    try {
+      IndexSchema searcherSchema = searcher == null ? null : searcher.get().getSchema();
+      // A concurrent update may already have registered an even newer schema.
+      if (searcherSchema != target && searcherSchema != latest) {
+        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, errorMsg);
+      }
+    } finally {
+      if (searcher != null) {
+        searcher.decref();
+      }
+    }
   }
 
   private void waitForOtherReplicasToUpdate(TimeOut timeOut, int latestVersion) {
